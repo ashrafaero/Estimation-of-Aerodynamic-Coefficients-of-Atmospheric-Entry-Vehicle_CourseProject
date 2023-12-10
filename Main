@@ -1,0 +1,268 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Dec  8 17:56:34 2023
+
+@author: Ashraf
+"""
+
+import numpy as np
+import pandas as pd
+from scipy.optimize import curve_fit
+import matplotlib.pyplot as plt
+#from scipy.special import factorial as fac  # fac(n)
+# import all required Pyro/Pytorch libraries
+import torch
+torch.set_default_tensor_type(torch.FloatTensor) # set the default to float32
+import pyro
+import pyro.distributions as dist
+# We will use Markov Chain Monte Carlo (MCMC) methods here, specifically the No U-Turn Sampler (NUTS)
+from pyro.infer import MCMC, NUTS#, Predictive
+#from scipy.signal import find_peaks
+
+###############################################################################  
+#%% FFCFD DATA
+def loadData(freq):
+    m250amp010 = pd.read_csv(
+        "Mach 2.50/amp010/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+    m250amp020 = pd.read_csv(
+        "Mach 2.50/amp020/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+    m250amp050 = pd.read_csv(
+        "Mach 2.50/amp050/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+    m250amp100 = pd.read_csv(
+        "Mach 2.50/amp100/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+    m250amp200 = pd.read_csv(
+        "Mach 2.50/amp200/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+    m250amp300 = pd.read_csv(
+        "Mach 2.50/amp300/Body_1_Dynamics_Data.csv", dtype=np.float64, sep='\s+')
+
+    avail_in_angles = np.array([1, 2, 5, 10, 20, 30])
+    endidx = 153318
+    
+    AAs = np.zeros([avail_in_angles.shape[0], np.arange(0, endidx, freq).shape[0]])
+    AAs_dot = np.zeros([avail_in_angles.shape[0], np.arange(0, endidx, freq).shape[0]])
+    MMs = np.zeros([avail_in_angles.shape[0], np.arange(0, endidx, freq).shape[0]])
+    # LLs = np.zeros([avail_in_angles.shape[0], np.arange(0,endidx,freq).shape[0]])
+    
+    AAs[0, :] = m250amp010['Pitch'][0:endidx:freq]
+    AAs[1, :] = m250amp020['Pitch'][0:endidx:freq]
+    AAs[2, :] = m250amp050['Pitch'][0:endidx:freq]
+    AAs[3, :] = m250amp100['Pitch'][0:endidx:freq]
+    AAs[4, :] = m250amp200['Pitch'][0:endidx:freq]
+    AAs[5, :] = m250amp300['Pitch'][0:endidx:freq]
+    
+    AAs_dot[0, :] = m250amp010['wz'][0:endidx:freq]
+    AAs_dot[1, :] = m250amp020['wz'][0:endidx:freq]
+    AAs_dot[2, :] = m250amp050['wz'][0:endidx:freq]
+    AAs_dot[3, :] = m250amp100['wz'][0:endidx:freq]
+    AAs_dot[4, :] = m250amp200['wz'][0:endidx:freq]
+    AAs_dot[5, :] = m250amp300['wz'][0:endidx:freq]
+    
+    MMs[0, :] = m250amp010['Mz_Lab'][0:endidx:freq]
+    MMs[1, :] = m250amp020['Mz_Lab'][0:endidx:freq]
+    MMs[2, :] = m250amp050['Mz_Lab'][0:endidx:freq]
+    MMs[3, :] = m250amp100['Mz_Lab'][0:endidx:freq]
+    MMs[4, :] = m250amp200['Mz_Lab'][0:endidx:freq]
+    MMs[5, :] = m250amp300['Mz_Lab'][0:endidx:freq]
+    
+    t = np.array(m250amp010['Time'][0:endidx:freq] - m250amp010['Time'][0])
+
+    return t, AAs, AAs_dot, MMs
+
+in_angles = np.array([1, 2, 5, 10, 20, 30])
+freq = 100
+t, AAs, AAs_dot, MMs = loadData(freq)
+# INPUTS:
+M = 2.5
+# Assign Parameters:
+a = 343.11   # speed of sound 
+v0 =M*a     # initial velocity
+m = 0.584    # mass in kg
+rho = 1.20  # freestream density
+D = 0.07      # diameter
+s = (np.pi)* D**2/4 # area
+Izz = 1.55E-4  #moment of inertia in kg-m2
+# Scaling constants: 
+C1 = (rho*v0**2*s*D)/(Izz);  # [1/sec^2]
+C2 = (rho*v0*s)/(2*m);       # [1/sec] -->  C2**2;  # [1/sec^2]
+C3 = (rho*v0*s*D**2)/(Izz);  # [1/sec]
+# Set the number of States
+N = 2
+# Set the initial condition
+x0 = np.deg2rad(in_angles[4]);
+# Set the integration parameters
+dt = t[1]-t[0];
+t_start = t[0]
+t_end   = t[-1] 
+# Create an array to store the time steps
+num_steps = len(t)
+# Noise parameters:
+eta = 0.000
+
+# Training factor 
+T_fact = 1 
+# Trained steps
+num_steps_trained = int(num_steps*T_fact) 
+# X model Initialization:
+x_m = np.zeros((num_steps_trained, N))
+x_m[0] = x0
+
+# No. of Parameters:
+N_P = 5
+# Create arrays to store the predicted solution
+# MEAN:
+X_Pred = np.zeros((num_steps, N))
+x_solution_pred = np.zeros((num_steps, N))
+x_solution_pred[0] = x0
+
+# X Full observations:
+X0 = AAs[4,:] # Alpha
+X1 = AAs_dot[4,:] # Alpha_dot (1/sec)
+X2 = MMs[4,:]/Izz
+dynm = 0.5*rho*v0**2*s*D
+C_m_obs = MMs[4,:]/dynm
+# X Trained batch
+X_state = np.zeros((num_steps, N))
+X_state[:,0] = X0
+X_state[:,1] = X1
+X_trained = X_state[0:num_steps_trained,:];
+
+# Aerodynamic Coefficients and Derivatives Priors Estimation:
+#### Inference with Scipy.curve_fit for Prior Parameters Estimation #######
+# define the assumed dynamics:
+def func(X, d_prior0, d_prior1, d_prior2, d_prior3, d_prior4): 
+    Alpha_ddot = (  (1/2)*C1*d_prior2 + (1/8)*C1*d_prior0*d_prior4  + C2**2*d_prior1*d_prior0  )*X[0]     \
+                        +(  (1/4)*C3*(d_prior3+d_prior4) - C2*d_prior0  )*X[1]     
+    return  Alpha_ddot
+# Data Fitting:
+X = (X0, X1)
+Low_bound = np.array([-2.0, 0.5, -0.5, -0.5, -0.5]); 
+Up_bound  = np.array([-0.5, 5.0, -0.03, 0.00, 0.00]);
+popt, pcov = curve_fit(func, X, X2, bounds = (Low_bound,Up_bound)) 
+print(popt)
+CL_alpha = popt[0]; 
+CD = popt[1]; 
+Cm_alpha=popt[2];
+Cm_dot_alpha=popt[3];
+Cm_q=popt[4];
+Alpha_ddot=func(X, CL_alpha, CD, Cm_alpha, Cm_dot_alpha, Cm_q)
+C_m_model = (Alpha_ddot*Izz)/dynm
+    
+plt.figure(figsize=(10, 6), dpi=500)
+#plt.subplot(1,2,2)
+plt.plot(t, C_m_obs, '--',linewidth=2.0, color='k', label='FFCFD')
+plt.plot(t, C_m_model, linewidth=2.0, color='b', label='LMA model')
+plt.xlabel('Time, s', fontsize=18)   
+plt.ylabel('$C_{m}$', fontsize=18)
+plt.tick_params(axis='both', which='major', labelsize=17)
+plt.legend(fontsize=17)
+#plt.title('Non-dimensional total pitching moment trajectory', fontsize=18)
+#plt.title(r'$\alpha_{0}$ = '+'{}°'.format(in_angles[q]), fontsize=18)  
+plt.grid(True)
+#plt.savefig('FFCFD_AOA_C_m trajectory.png', dpi=500)
+plt.show()
+
+# RMSE
+RMSE = np.sqrt(np.mean((C_m_obs - C_m_model) ** 2))*100 
+
+
+########## MCMC-NUTS ####################
+# Priors Bounds
+Cm_alpha = -0.183
+d_m = np.array([CL_alpha,CD,Cm_alpha,Cm_dot_alpha,Cm_q]);
+std = np.array([0.00001, 0.00001, 0.000001, 0.000002, 0.000002]);
+d_lower = torch.from_numpy(d_m)-torch.from_numpy(std)
+d_upper = torch.from_numpy(d_m)+torch.from_numpy(std)
+
+# Mean and STD arrays storage
+d_mean = np.zeros((N_P,N))
+d_std  = np.zeros((N_P,N))
+# Modeled ODE and forward path (RK4) functions of the model:
+def dxdt_model(x_m, d, Check, C1, C2, C3):
+    N = len(x_m)
+    dxdt_m = np.zeros(N)
+    if Check == 0: # For the model 
+        d = d.detach().numpy()
+    elif Check == 1:
+        d = d # For prediction 
+    dxdt_m[0] = x_m[1]
+    # CASE (1) Linear
+    dxdt_m[1] = (  (1/2)*C1*d[2] + (1/8)*C1*d[0]*d[4]  + C2**2*d[1]*d[0]  )*x_m[0]     \
+                   +(  (1/4)*C3*(d[3]+d[4]) - C2*d[0]  )*x_m[1]     
+    return dxdt_m
+def rk4_model(x_m, d, Check,C1, C2, C3, dt):
+    k1 = dxdt_model(x_m, d, Check,C1, C2, C3)
+    k2 = dxdt_model(x_m + 0.5 * dt * k1, d, Check,C1, C2, C3)
+    k3 = dxdt_model(x_m + 0.5 * dt * k2, d, Check,C1, C2, C3)
+    k4 = dxdt_model(x_m + dt * k3, d, Check,C1, C2, C3)
+    x_new_m = x_m + (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return x_new_m
+# Check
+Check = 0;
+# MODEL SIMULATION:
+for k in range(N):
+    def model(X_trained, t ,C1, C2, C3, dt, num_steps_trained):
+        # d Priors
+        d = pyro.sample("d", dist.Uniform(d_lower, d_upper))
+        for n in range(1, num_steps_trained):
+            x_m[n] = rk4_model(x_m[n-1], d, Check,C1, C2, C3, dt)
+        # Turn out model data of "x_m" into PyTorch
+        x_mean = torch.from_numpy(x_m[:,k]) 
+        # Define a sigma prior for the random error
+        x_sigma = pyro.sample("x_sigma", dist.HalfNormal(scale = 0.1))
+        ## Likelihood:
+        with pyro.plate("data", size = X_trained.shape[0]):
+          # Assume our expected mean comes from a normal distribution
+          outcome_dist = dist.Normal(x_mean, x_sigma)
+          # Condition the expected mean on the observed target y
+          return pyro.sample("obs", outcome_dist, obs = X_trained[:,k])    
+    # Turn out numpy data into PyTorch tensors
+    X_train_torch = torch.from_numpy(X_trained)
+    # Sampling Control
+    wu = 20   # number of warmup samples
+    sn = 30   # number of samples
+    pyro.clear_param_store() # Clear the parameter storage
+    # Initialize our No U-Turn Sampler
+    my_kernel = NUTS(model, max_tree_depth=4 )  # a shallower tree helps the algorithm run faster
+    # MCMC 
+    my_mcmc1 = MCMC(my_kernel, num_samples=sn, warmup_steps=wu) 
+    # Run the sampler
+    my_mcmc1.run(X_train_torch, t ,C1, C2, C3, dt, num_steps_trained)
+    # Getting the samples
+    samples = my_mcmc1.get_samples()
+    # Model summary
+    #print(my_mcmc1.summary())
+    #print(samples)
+    # Estimated d:
+    d_obs = samples['d'].numpy()
+    d_mean[:,k] = np.array(d_obs).mean(axis=0)
+    d_std[:,k] = np.array(d_obs).std(axis=0)
+# Print estimated d:
+d_m_est = d_mean.mean(axis=1)
+d_std_est = d_std.mean(axis=1)  
+print('Mean of estimated d = ')
+print(d_m_est)
+print('Std of estimated d = ')
+print(d_std_est)
+## Prediction Part :
+# Here we test the model performance for a longer time, i.e., we project the model upon the observations and see how well it performs for a longer time that beyond the training time
+# Trajectory: 
+d_m_est = np.array([CL_alpha,CD,-0.183,Cm_dot_alpha,Cm_q]) 
+Check = 1;
+for n in range(1, num_steps):
+  x_solution_pred[n] = rk4_model(x_solution_pred[n - 1], d_m_est, Check,C1, C2, C3, dt)    
+X_Pred=x_solution_pred
+
+#Plotting DATA (AOA) :
+plt.figure(figsize=(10, 6), dpi=500)
+plt.plot(t, np.rad2deg(X0), '--',linewidth=2.0, color='k', label='FFCFD')
+plt.plot(t, np.rad2deg(X_Pred[:,0]), linewidth=2.0, color='b', label='MCMC-NUTS model')
+plt.xlabel('Time, s', fontsize=18)
+plt.ylabel(r'$\alpha$'+'°', fontsize=18)
+plt.legend(fontsize=17)
+plt.tick_params(axis='both', which='major', labelsize=17)
+plt.grid(True)
+#plt.savefig('Angle of attack trajectory.png', dpi=500)
+plt.show()
+# RMSE2
+RMSE2 = np.sqrt(np.mean((X0 - X_Pred[:,0]) ** 2))*100; 
+print (RMSE2)
